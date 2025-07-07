@@ -7,13 +7,6 @@ OUT_CSV=../data/resultsbm.csv
 > "$OUT_CSV"
 echo -e "Thread Count,Gen Time (s),Tokens Generated,Tokens/sec(Weighted mean)\n" >> "$OUT_CSV"
 
-# Prompts used for benchmarking:
-# Prompt 1: Here is a comprehensive essay on the evolution of deep learning, covering convolutional neural networks, recurrent neural networks, transformers, and their impact on modern AI systems. Deep learning emerged 
-# Prompt 2: 
-# Prompt 3: An in-depth analysis of the industrial revolution, its causes, technological innovations, and the socio-economic transformations it triggered across Europe and America. The industrial revolution started 
-# Prompt 4: A detailed explanation of climate change, its scientific basis, historical trends, and the global response through policy and innovation. Climate change refers to 
-# Prompt 5: This essay examines existential philosophy, focusing on thinkers like Kierkegaard, Nietzsche, and Sartre, and their views on meaning, freedom, and authenticity. Existentialism is a philosophical 
-
 # Measure model-load time once via a 0-token dummy run
 START_LOAD=$(date +%s.%N)
 $CLI -m "$MODEL" -n 0 --seed 0 >/dev/null
