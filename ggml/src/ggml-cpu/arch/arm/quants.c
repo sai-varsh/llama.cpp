@@ -2123,6 +2123,16 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
 }
 
+static inline void ggml_decode_q4scales_and_mins_for_mmla(uint32_t *vx_scales, uint32_t *utmp) {
+  static const uint32_t kmask1 = 0x3f3f3f3f;
+  static const uint32_t kmask2 = 0x0f0f0f0f;
+  static const uint32_t kmask3 = 0x03030303;
+  utmp[0] = vx_scales[0] & kmask1;
+  utmp[2] = (vx_scales[2] & kmask2) | (((vx_scales[0] >> 6) & kmask3) << 4);
+  utmp[4] = vx_scales[1] & kmask1;
+  utmp[6] = ((vx_scales[2] >> 4) & kmask2) | (((vx_scales[1] >> 6) & kmask3) << 4);
+}
+
 void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
 #ifdef __ARM_FEATURE_MATMUL_INT8
@@ -2147,6 +2157,229 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     uint32_t utmp[4];
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+#ifdef __ARM_FEATURE_SVE
+    if (nrc==2) {
+#ifdef GET_PA
+      pthread_mutex_lock(&mutex);
+      q4_K_data.i8mm_counter++;
+      struct timespec i8mm_start_ts, i8mm_end_ts;
+      clock_gettime(CLOCK_REALTIME, &i8mm_start_ts);
+      pthread_mutex_unlock(&mutex);
+#endif
+#ifdef GET_PAPI
+      static int papi_mmla_flag = 0;
+      if (papi_mmla_flag == 0) {
+        PAPI_hl_region_begin("ggml_vec_dot_q4_K_q8_K mmla route");
+      }
+#endif
+      svbool_t pg32_2 = svptrue_pat_b32(SV_VL2);
+      svbool_t pg32_4 = svptrue_pat_b32(SV_VL4);
+      svbool_t pg64_2 =svptrue_pat_b64(SV_VL2);
+      svbool_t pg8_16  =svptrue_pat_b8(SV_VL16);
+      const block_q4_K * GGML_RESTRICT vx0 = vx;
+      const block_q8_K * GGML_RESTRICT vy0 = vy;
+      const block_q4_K * GGML_RESTRICT vx1 = (const block_q4_K *) ((const uint8_t*)vx + bx);
+      const block_q8_K * GGML_RESTRICT vy1 = (const block_q8_K *) ((const uint8_t*)vy + by);
+      svfloat32_t sumf1 = svdup_n_f32(0);
+      for (int i = 0; i < nb; ++i) {
+        const float super_block_scales[4] = {vy0[i].d * GGML_FP16_TO_FP32(vx0[i].d),
+                                             vy0[i].d * GGML_FP16_TO_FP32(vx1[i].d),
+                                             vy1[i].d * GGML_FP16_TO_FP32(vx0[i].d),
+                                             vy1[i].d * GGML_FP16_TO_FP32(vx1[i].d)};
+        const float dmins[4] = {vy0[i].d * GGML_FP16_TO_FP32(vx0[i].dmin),
+                                vy0[i].d * GGML_FP16_TO_FP32(vx1[i].dmin),
+                                vy1[i].d * GGML_FP16_TO_FP32(vx0[i].dmin),
+                                vy1[i].d * GGML_FP16_TO_FP32(vx1[i].dmin)};
+
+        const uint8_t * GGML_RESTRICT q4_0 = vx0[i].qs;
+        const int8_t  * GGML_RESTRICT q8_0 = vy0[i].qs;
+        const uint8_t * GGML_RESTRICT q4_1 = vx1[i].qs;
+        const int8_t  * GGML_RESTRICT q8_1 = vy1[i].qs;
+
+        const int vector_length = ggml_cpu_get_sve_cnt()*8;
+        const svuint8_t m4b = svdup_n_u8(0xf);
+        svint32_t svscales, sumi1, sumi2;
+        int32_t local_scales[4];
+        svfloat32_t svsuper_block_scales = svld1_f32(pg32_4, super_block_scales);
+        svint32_t acc_sumif1 = svdup_n_s32(0);
+        svint32_t acc_sumif2 = svdup_n_s32(0);
+        svint8_t q4bytes_0_l, q4bytes_0_h, q4bytes_1_l, q4bytes_1_h, l0, l1, l2, l3, \
+                 q8bytes_0_h, q8bytes_0_l, q8bytes_1_h, q8bytes_1_l, r0, r1, r2, r3 ;
+        switch (vector_length) {
+          case 128:
+            {
+              svbool_t pg16_8 =svptrue_pat_b16(SV_VL8);
+              svbool_t pg16_7 =svptrue_pat_b16(SV_VL7);
+              svint16_t svq8sums_0 = svuzp1_s16(svadd_s16_x(pg16_8,
+                                                            svld1_s16(pg16_8, vy0[i].bsums),
+                                                            svld1_s16(pg16_7, vy0[i].bsums + 1)),
+                                                svadd_s16_x(pg16_8,
+                                                            svld1_s16(pg16_8, vy0[i].bsums + 8),
+                                                            svld1_s16(pg16_7, vy0[i].bsums + 9)));
+              svint16_t svq8sums_1 = svuzp1_s16(svadd_s16_x(pg16_8,
+                                                            svld1_s16(pg16_8, vy1[i].bsums),
+                                                            svld1_s16(pg16_7, vy1[i].bsums + 1)),
+                                                svadd_s16_x(pg16_8,
+                                                            svld1_s16(pg16_8, vy1[i].bsums + 8),
+                                                            svld1_s16(pg16_7, vy1[i].bsums + 9)));
+
+              uint32_t utmp0[4], utmp1[4], new_utmp[8];
+              ggml_decode_q4scales_and_mins_for_mmla((uint32_t *)vx0[i].scales, new_utmp);
+              ggml_decode_q4scales_and_mins_for_mmla((uint32_t *)vx1[i].scales, new_utmp+1);
+              uint32_t mins_mask1 = 0x0101;
+              svbool_t vmins_mask1 = *((svbool_t *)(&mins_mask1));
+              uint32_t mins_mask2 = 0x1010;
+              svbool_t vmins_mask2 = *((svbool_t *)(&mins_mask2));
+              svint16_t svmins8_0 = svreinterpret_s16_u16(svunpklo_u16(svreinterpret_u8_u32(svuzp1_u32(svld1_u32(vmins_mask1, new_utmp+4), svdup_n_u32(0)))));
+              svint16_t svmins8_1 = svreinterpret_s16_u16(svunpklo_u16(svreinterpret_u8_u32(svuzp2_u32(svld1_u32(vmins_mask2, new_utmp+4), svdup_n_u32(0)))));
+
+              const float sumfs[4] = {-dmins[0] * (float)svaddv_s64(pg64_2, svdot_s64(svdup_n_s64(0), svq8sums_0, svmins8_0)),
+                                      -dmins[1] * (float)svaddv_s64(pg64_2, svdot_s64(svdup_n_s64(0), svq8sums_0, svmins8_1)),
+                                      -dmins[2] * (float)svaddv_s64(pg64_2, svdot_s64(svdup_n_s64(0), svq8sums_1, svmins8_0)),
+                                      -dmins[3] * (float)svaddv_s64(pg64_2, svdot_s64(svdup_n_s64(0), svq8sums_1, svmins8_1))};
+              svfloat32_t svsumfs = svld1_f32(pg32_4, sumfs);
+              for (int j = 0; j < QK_K/64; ++j) {
+                q4bytes_0_l = svreinterpret_s8_u8(svand_u8_x(pg8_16, svld1_u8(pg8_16, q4_0), m4b));
+                q4bytes_1_l = svreinterpret_s8_u8(svand_u8_x(pg8_16, svld1_u8(pg8_16, q4_1), m4b));
+                q4bytes_0_h = svreinterpret_s8_u8(svand_u8_x(pg8_16, svld1_u8(pg8_16, q4_0+16), m4b));
+                q4bytes_1_h = svreinterpret_s8_u8(svand_u8_x(pg8_16, svld1_u8(pg8_16, q4_1+16), m4b));
+                l0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q4bytes_0_l), svreinterpret_s64_s8(q4bytes_1_l)));
+                l1 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q4bytes_0_l), svreinterpret_s64_s8(q4bytes_1_l)));
+                l2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q4bytes_0_h), svreinterpret_s64_s8(q4bytes_1_h)));
+                l3 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q4bytes_0_h), svreinterpret_s64_s8(q4bytes_1_h)));
+                q8bytes_0_h = svld1_s8(pg8_16, q8_0);
+                q8bytes_1_h = svld1_s8(pg8_16, q8_1);
+                q8bytes_0_l = svld1_s8(pg8_16, q8_0+16);
+                q8bytes_1_l = svld1_s8(pg8_16, q8_1+16);
+                r0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_0_h), svreinterpret_s64_s8(q8bytes_1_h)));
+                r1 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_0_h), svreinterpret_s64_s8(q8bytes_1_h)));
+                r2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_0_l), svreinterpret_s64_s8(q8bytes_1_l)));
+                r3 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_0_l), svreinterpret_s64_s8(q8bytes_1_l)));
+                sumi1 = svmmla_s32(svmmla_s32(svmmla_s32(svmmla_s32(svdup_n_s32(0), r0, l0), r1, l1), r2, l2), r3, l3);
+                svscales = svreinterpret_s32_u32(svlsr_n_u32_x(pg32_4, svlsl_n_u32_x(pg32_4, svreinterpret_u32_u64(svdup_n_u64(*(uint64_t *)(new_utmp+2*(j/2)))), 8*(4-2*(j%2)-1)), 24));
+                acc_sumif1 = svmla_s32_x(pg32_4, acc_sumif1, svscales, sumi1);
+
+                q4bytes_0_l = svreinterpret_s8_u8(svlsr_n_u8_x(pg8_16, svld1_u8(pg8_16, q4_0), 4));
+                q4bytes_1_l = svreinterpret_s8_u8(svlsr_n_u8_x(pg8_16, svld1_u8(pg8_16, q4_1), 4));
+                q4bytes_0_h = svreinterpret_s8_u8(svlsr_n_u8_x(pg8_16, svld1_u8(pg8_16, q4_0+16), 4));
+                q4bytes_1_h = svreinterpret_s8_u8(svlsr_n_u8_x(pg8_16, svld1_u8(pg8_16, q4_1+16), 4));
+                l0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q4bytes_0_l), svreinterpret_s64_s8(q4bytes_1_l)));
+                l1 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q4bytes_0_l), svreinterpret_s64_s8(q4bytes_1_l)));
+                l2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q4bytes_0_h), svreinterpret_s64_s8(q4bytes_1_h)));
+                l3 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q4bytes_0_h), svreinterpret_s64_s8(q4bytes_1_h)));
+                q8bytes_0_h = svld1_s8(pg8_16, q8_0+32);
+                q8bytes_1_h = svld1_s8(pg8_16, q8_1+32);
+                q8bytes_0_l = svld1_s8(pg8_16, q8_0+48);
+                q8bytes_1_l = svld1_s8(pg8_16, q8_1+48);
+                r0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_0_h), svreinterpret_s64_s8(q8bytes_1_h)));
+                r1 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_0_h), svreinterpret_s64_s8(q8bytes_1_h)));
+                r2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_0_l), svreinterpret_s64_s8(q8bytes_1_l)));
+                r3 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_0_l), svreinterpret_s64_s8(q8bytes_1_l)));
+                sumi2 = svmmla_s32(svmmla_s32(svmmla_s32(svmmla_s32(svdup_n_s32(0), r0, l0), r1, l1), r2, l2), r3, l3);
+                svscales = svreinterpret_s32_u32(svlsr_n_u32_x(pg32_4, svlsl_n_u32_x(pg32_4, svreinterpret_u32_u64(svdup_n_u64(*(uint64_t *)(new_utmp+2*(j/2)))), 8*(4-2*(j%2)-2)), 24));
+                acc_sumif2 = svmla_s32_x(pg32_4, acc_sumif2, svscales, sumi2);
+                q4_0 += 32; q4_1 += 32; q8_0 += 64; q8_1 += 64;
+              }
+              sumf1 = svadd_f32_x(pg32_4, sumf1, \
+                                  svadd_f32_x(pg32_4, \
+                                              svmul_f32_x(pg32_4, \
+                                                          svcvt_f32_x(pg32_4,
+                                                                      svadd_s32_x(pg32_4, acc_sumif1, acc_sumif2)), \
+                                                          svsuper_block_scales), \
+                                              svsumfs));
+            } // end of case 128
+            break;
+          case 256:
+          case 512:
+            {
+              // for 256bit
+              svbool_t pg16_16 = svptrue_pat_b16(SV_VL16);
+              svbool_t pg8_32 = svptrue_pat_b8(SV_VL32);
+              svbool_t pg32_8 = svptrue_pat_b32(SV_VL8);
+              svbool_t pg64_4 = svptrue_pat_b64(SV_VL4);
+              svint16_t rc1 = svuzp1_s16(svld1_s16(pg16_16, vy0[i].bsums), svld1_s16(pg16_16, vy1[i].bsums));
+              svint16_t rc2 = svuzp2_s16(svld1_s16(pg16_16, vy0[i].bsums), svld1_s16(pg16_16, vy1[i].bsums));
+              svint16_t svq8sums = svadd_s16_x(pg16_16, rc1, rc2);
+
+              uint32_t utmp[8];
+              ggml_decode_q4scales_and_mins_for_mmla((uint32_t *)vx0[i].scales, utmp);
+              ggml_decode_q4scales_and_mins_for_mmla((uint32_t *)vx1[i].scales, utmp+1);
+              // new modification
+              svint16_t new_svq8sums_0 = svreinterpret_s16_u64(svtrn1_u64(svreinterpret_u64_s16(svq8sums), svreinterpret_u64_s16(svq8sums)));
+              svint16_t new_svq8sums_1 = svreinterpret_s16_u64(svtrn2_u64(svreinterpret_u64_s16(svq8sums), svreinterpret_u64_s16(svq8sums)));
+              svuint64_t new_mins_0 = svdup_u64(*(uint64_t *)(utmp+4));
+              svuint64_t new_mins_1 = svdup_u64(*(uint64_t *)(utmp+6));
+              svint16_t new_svmins8_0 = svreinterpret_s16_u16(svunpklo_u16(svreinterpret_u8_u64(new_mins_0)));
+              svint16_t new_svmins8_1 = svreinterpret_s16_u16(svunpklo_u16(svreinterpret_u8_u64(new_mins_1)));
+              svint64_t dot_prod_0 = svdot_s64(svdup_s64(0), new_svmins8_0, new_svq8sums_0);
+              svint64_t dot_prod_1 = svdot_s64(dot_prod_0, new_svmins8_1, new_svq8sums_1);
+              double new_dmins[4] = {-dmins[0], -dmins[1], -dmins[2], -dmins[3]};
+              svfloat64_t new_svdims = svld1_f64(pg64_4, new_dmins);
+              svfloat64_t new_tmp_svsumfs = svmul_f64_x(pg64_4, new_svdims, svcvt_f64_s64_x(pg64_4, dot_prod_1));
+              uint32_t idx0[8] = { 0u, 2u, 4u, 6u, 1u, 3u, 5u, 7u };
+              svfloat32_t svsumfs = svtbl_f32(svcvt_f32_f64_x(pg64_4, new_tmp_svsumfs), svld1_u32(pg32_8, idx0));
+
+
+              // calc mmla
+              for (int j = 0; j < QK_K/64; ++j) {
+                svuint8_t q4bytes_0 = svand_u8_x(pg8_32, svld1_u8(pg8_32, q4_0), m4b);
+                svuint8_t q4bytes_1 = svand_u8_x(pg8_32, svld1_u8(pg8_32, q4_1), m4b);
+                svuint8_t q4bytes_2 = svlsr_n_u8_x(pg8_32, svld1_u8(pg8_32, q4_0), 4);
+                svuint8_t q4bytes_3 = svlsr_n_u8_x(pg8_32, svld1_u8(pg8_32, q4_1), 4);
+                l0 = svreinterpret_s8_u64(svzip1_u64(svreinterpret_u64_u8(q4bytes_0), svreinterpret_u64_u8(q4bytes_1)));
+                l1 = svreinterpret_s8_u64(svzip2_u64(svreinterpret_u64_u8(q4bytes_0), svreinterpret_u64_u8(q4bytes_1)));
+                l2 = svreinterpret_s8_u64(svzip1_u64(svreinterpret_u64_u8(q4bytes_2), svreinterpret_u64_u8(q4bytes_3)));
+                l3 = svreinterpret_s8_u64(svzip2_u64(svreinterpret_u64_u8(q4bytes_2), svreinterpret_u64_u8(q4bytes_3)));
+                svint8_t q8bytes_0 = svld1_s8(pg8_32, q8_0);
+                svint8_t q8bytes_1 = svld1_s8(pg8_32, q8_1);
+                svint8_t q8bytes_2 = svld1_s8(pg8_32, q8_0+32);
+                svint8_t q8bytes_3 = svld1_s8(pg8_32, q8_1+32);
+                r0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_0), svreinterpret_s64_s8(q8bytes_1)));
+                r1 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_0), svreinterpret_s64_s8(q8bytes_1)));
+                r2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_2), svreinterpret_s64_s8(q8bytes_3)));
+                r3 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_2), svreinterpret_s64_s8(q8bytes_3)));
+                sumi1 = svmmla(svmmla(svdup_n_s32(0), r0, l0), r1, l1);
+                sumi2 = svmmla(svmmla(svdup_n_s32(0), r2, l2), r3, l3);
+                svscales = svreinterpret_s32_u32(svlsr_n_u32_x(pg32_8, svlsl_n_u32_x(pg32_8, svreinterpret_u32_u64(svdup_n_u64(*(uint64_t *)(utmp+2*(j/2)))), 8*(4-2*(j%2)-1)), 24));
+                acc_sumif1 = svmla_s32_x(pg32_8, acc_sumif1, svscales, sumi1);
+
+                svscales = svreinterpret_s32_u32(svlsr_n_u32_x(pg32_8, svlsl_n_u32_x(pg32_8, svreinterpret_u32_u64(svdup_n_u64(*(uint64_t *)(utmp+2*(j/2)))), 8*(4-2*(j%2)-2)), 24));
+                acc_sumif2 = svmla_s32_x(pg32_8, acc_sumif2, svscales, sumi2);
+                q4_0 += 32; q4_1 += 32; q8_0 += 64; q8_1 += 64;
+              }
+              svint32_t acc_sumif = svadd_s32_x(pg32_8, acc_sumif1, acc_sumif2);
+              svint32_t swap_acc_sumif = svext_s32(acc_sumif, acc_sumif, 4);
+              acc_sumif = svadd_s32_x(pg32_4, acc_sumif, swap_acc_sumif);
+              sumf1 = svadd_f32_x(pg32_4, sumf1,
+                                  svadd_f32_x(pg32_4,
+                                              svmul_f32_x(pg32_4,
+                                                          svcvt_f32_x(pg32_4, acc_sumif),
+                                                          svsuper_block_scales),
+                                              svsumfs));
+            } // end of case 256-512
+            break;
+          default:
+            assert(false && "Unsupported vector length");
+            break;
+        }
+      }
+      svst1_f32(pg32_2, s, sumf1);
+      svst1_f32(pg32_2, s + bs, svreinterpret_f32_u8(svext_u8(svreinterpret_u8_f32(sumf1), svdup_n_u8(0), 8)));
+#ifdef GET_PA
+      pthread_mutex_lock(&mutex);
+      clock_gettime(CLOCK_REALTIME, &i8mm_end_ts);
+      q4_K_data.i8mm_nsec += (i8mm_end_ts.tv_sec - i8mm_start_ts.tv_sec) * 1e9L + (i8mm_end_ts.tv_nsec - i8mm_start_ts.tv_nsec);
+      pthread_mutex_unlock(&mutex);
+#endif
+#ifdef GET_PAPI
+      if (papi_mmla_flag == 0) {
+        papi_mmla_flag++;
+        PAPI_hl_region_end("ggml_vec_dot_q4_K_q8_K mmla route");
+      }
+#endif
+      return ;
+    }
+#else
     if (nrc == 2) {
         const block_q4_K * GGML_RESTRICT x0 = x;
         const block_q4_K * GGML_RESTRICT x1 = (const block_q4_K *) ((const uint8_t *)vx + bx);
@@ -2284,6 +2517,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         return;
     }
+#endif //SVE or NEON
 #endif
 
 #ifdef __ARM_FEATURE_SVE
@@ -2659,6 +2893,340 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const int nb = n / QK_K;
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+#if __ARM_FEATURE_SVE
+    if (nrc==2) {
+      const int vector_length = ggml_cpu_get_sve_cnt()*8;
+#ifdef GET_PA
+      pthread_mutex_lock(&mutex);
+      q6_K_data.i8mm_counter++;
+      struct timespec i8mm_start_ts, i8mm_end_ts;
+      clock_gettime(CLOCK_REALTIME, &i8mm_start_ts);
+      pthread_mutex_unlock(&mutex);
+#endif
+      svuint8_t m4b = svdup_n_u8(0xf);
+      svuint8_t mone = svdup_n_u8(0x30);
+      svint8_t q6bytes_01, q6bytes_02, q6bytes_03, q6bytes_04,
+               q6bytes_11, q6bytes_12, q6bytes_13, q6bytes_14;
+      svuint8_t q6h_01, q6h_02, q6h_03, q6h_04,
+                q6h_11, q6h_12, q6h_13, q6h_14;
+      const svbool_t pg16_8 = svptrue_pat_b16(SV_VL8);
+      const svbool_t pg32_4 = svptrue_pat_b32(SV_VL4);
+      const svbool_t pg32_2 = svptrue_pat_b32(SV_VL2);
+      const svbool_t pg8_16 = svptrue_pat_b8(SV_VL16);
+      const svbool_t pg8_8 = svptrue_pat_b8(SV_VL8);
+      // for 256 bit SIMD
+      const svbool_t pg16_16 = svptrue_pat_b16(SV_VL16);
+      const svbool_t pg32_8 = svptrue_pat_b32(SV_VL8);
+      svfloat32_t sum = svdup_n_f32(0);
+      const block_q6_K * GGML_RESTRICT vx0 = vx;
+      const block_q8_K * GGML_RESTRICT vy0 = vy;
+      const block_q6_K * GGML_RESTRICT vx1 = (const block_q6_K *) ((const uint8_t*)vx + bx);
+      const block_q8_K * GGML_RESTRICT vy1 = (const block_q8_K *) ((const uint8_t*)vy + by);
+      for (int i = 0; i < nb; ++i) {
+        float super_block_scales[4] = { GGML_FP16_TO_FP32(vx0[i].d) * vy0[i].d,
+                                        GGML_FP16_TO_FP32(vx1[i].d) * vy0[i].d,
+                                        GGML_FP16_TO_FP32(vx0[i].d) * vy1[i].d,
+                                        GGML_FP16_TO_FP32(vx1[i].d) * vy1[i].d };
+        svfloat32_t svsuper_block_scales = svld1_f32(pg32_4, super_block_scales);
+
+        const uint8_t * GGML_RESTRICT ql0 = vx0[i].ql;
+        const uint8_t * GGML_RESTRICT qh0 = vx0[i].qh;
+        const uint8_t * GGML_RESTRICT ql1 = vx1[i].ql;
+        const uint8_t * GGML_RESTRICT qh1 = vx1[i].qh;
+        const int8_t  * GGML_RESTRICT q80 = vy0[i].qs;
+        const int8_t  * GGML_RESTRICT q81 = vy1[i].qs;
+
+        const int8_t * GGML_RESTRICT scale0 = vx0[i].scales;
+        const int8_t * GGML_RESTRICT scale1 = vx1[i].scales;
+
+        switch (vector_length) {
+          case 128:
+            {
+              // process q8sum summation 128 bit route
+              const svint16_t q8sums_01 = svld1_s16(pg16_8, vy0[i].bsums);
+              const svint16_t q8sums_02 = svld1_s16(pg16_8, vy0[i].bsums + 8);
+              const svint16_t q8sums_11 = svld1_s16(pg16_8, vy1[i].bsums);
+              const svint16_t q8sums_12 = svld1_s16(pg16_8, vy1[i].bsums + 8);
+              const svint16_t q6scales_01 = svunpklo_s16(svld1_s8(pg8_8, scale0));
+              const svint16_t q6scales_02 = svunpklo_s16(svld1_s8(pg8_8, scale0 + 8));
+              const svint16_t q6scales_11 = svunpklo_s16(svld1_s8(pg8_8, scale1));
+              const svint16_t q6scales_12 = svunpklo_s16(svld1_s8(pg8_8, scale1 + 8));
+              const svint64_t prod = svdup_n_s64(0);
+              int32_t isum_mins[4] = {svaddv_s64(svptrue_b64(), svadd_s64_x(svptrue_b64(),
+                                                                            svdot_s64(prod, q8sums_01, q6scales_01),
+                                                                            svdot_s64(prod, q8sums_02, q6scales_02))),
+                                      svaddv_s64(svptrue_b64(), svadd_s64_x(svptrue_b64(),
+                                                                            svdot_s64(prod, q8sums_01, q6scales_11),
+                                                                            svdot_s64(prod, q8sums_02, q6scales_12))),
+                                      svaddv_s64(svptrue_b64(), svadd_s64_x(svptrue_b64(),
+                                                                            svdot_s64(prod, q8sums_11, q6scales_01),
+                                                                            svdot_s64(prod, q8sums_12, q6scales_02))),
+                                      svaddv_s64(svptrue_b64(), svadd_s64_x(svptrue_b64(),
+                                                                         svdot_s64(prod, q8sums_11, q6scales_11),
+                                                                         svdot_s64(prod, q8sums_12, q6scales_12)))};
+              svint32_t svisum_mins = svld1_s32(pg32_4, isum_mins);
+
+              // process mmla
+              svuint8_t qhbits_01, qhbits_02, qhbits_11, qhbits_12,
+                        q6bits_01, q6bits_02, q6bits_03, q6bits_04,
+                        q6bits_11, q6bits_12, q6bits_13, q6bits_14;
+              svint8_t  q8bytes_01, q8bytes_02, q8bytes_03, q8bytes_04, l0, l1, l2, l3, l4, l5, l6, l7,
+                        q8bytes_11, q8bytes_12, q8bytes_13, q8bytes_14, r0, r1, r2, r3, r4, r5, r6, r7;
+              svint32_t sumi1, sumi2, sumi3, sumi4, acc_sumi1, acc_sumi2, acc_tmp,
+                        svscale0, svscale1, svscale2, svscale3;
+              svint32_t isum_tmp = svdup_n_s32(0);
+              for (int j = 0; j < QK_K/128; ++j) {
+                int goto_flag = 1;
+                qhbits_01 = svld1_u8(pg8_16, qh0);     qhbits_02 = svld1_u8(pg8_16, qh0+16);
+                qhbits_11 = svld1_u8(pg8_16, qh1);     qhbits_12 = svld1_u8(pg8_16, qh1+16);
+                qh0 += 32; qh1 += 32;
+                q6bits_01 = svld1_u8(pg8_16, ql0);     q6bits_02 = svld1_u8(pg8_16, ql0+16);
+                q6bits_03 = svld1_u8(pg8_16, ql0+32);  q6bits_04 = svld1_u8(pg8_16, ql0+48);
+                q6bits_11 = svld1_u8(pg8_16, ql1);     q6bits_12 = svld1_u8(pg8_16, ql1+16);
+                q6bits_13 = svld1_u8(pg8_16, ql1+32);  q6bits_14 = svld1_u8(pg8_16, ql1+48);
+                ql0 += 64; ql1 += 64;
+                q8bytes_01 = svld1_s8(pg8_16, q80);    q8bytes_02 = svld1_s8(pg8_16, q80+16);
+                q8bytes_03 = svld1_s8(pg8_16, q80+32); q8bytes_04 = svld1_s8(pg8_16, q80+48);
+                q8bytes_11 = svld1_s8(pg8_16, q81);    q8bytes_12 = svld1_s8(pg8_16, q81+16);
+                q8bytes_13 = svld1_s8(pg8_16, q81+32); q8bytes_14 = svld1_s8(pg8_16, q81+48);
+                q80 += 64; q81 += 64;
+
+                // decode 6bit data of input00
+                // q6bytes_xx has 16 of block (each block has 16)
+                // each suffinx means input and block number
+                q6h_01 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_01, 4));
+                q6h_02 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_02, 4));
+                q6h_03 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_01, 2));
+                q6h_04 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_02, 2));
+                q6h_11 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_11, 4));
+                q6h_12 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_12, 4));
+                q6h_13 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_11, 2));
+                q6h_14 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_12, 2));
+
+                q6bytes_01 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_01, m4b), q6h_01));
+                q6bytes_02 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_02, m4b), q6h_02));
+                q6bytes_03 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_03, m4b), q6h_03));
+                q6bytes_04 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_04, m4b), q6h_04));
+                q6bytes_11 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_11, m4b), q6h_11));
+                q6bytes_12 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_12, m4b), q6h_12));
+                q6bytes_13 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_13, m4b), q6h_13));
+                q6bytes_14 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_14, m4b), q6h_14));
+
+                repeat:
+                // mmla
+                l0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q6bytes_01), svreinterpret_s64_s8(q6bytes_11)));
+                l1 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q6bytes_01), svreinterpret_s64_s8(q6bytes_11)));
+                l2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q6bytes_02), svreinterpret_s64_s8(q6bytes_12)));
+                l3 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q6bytes_02), svreinterpret_s64_s8(q6bytes_12)));
+                l4 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q6bytes_03), svreinterpret_s64_s8(q6bytes_13)));
+                l5 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q6bytes_03), svreinterpret_s64_s8(q6bytes_13)));
+                l6 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q6bytes_04), svreinterpret_s64_s8(q6bytes_14)));
+                l7 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q6bytes_04), svreinterpret_s64_s8(q6bytes_14)));
+                r0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_01), svreinterpret_s64_s8(q8bytes_11)));
+                r1 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_01), svreinterpret_s64_s8(q8bytes_11)));
+                r2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_02), svreinterpret_s64_s8(q8bytes_12)));
+                r3 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_02), svreinterpret_s64_s8(q8bytes_12)));
+                r4 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_03), svreinterpret_s64_s8(q8bytes_13)));
+                r5 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_03), svreinterpret_s64_s8(q8bytes_13)));
+                r6 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_04), svreinterpret_s64_s8(q8bytes_14)));
+                r7 = svreinterpret_s8_s64(svzip2_s64(svreinterpret_s64_s8(q8bytes_04), svreinterpret_s64_s8(q8bytes_14)));
+                // multiply scales of q6bit
+                int32_t tmp_scales[4][4] = { {scale0[0], scale1[0], scale0[0], scale1[0]},
+                                             {scale0[1], scale1[1], scale0[1], scale1[1]},
+                                             {scale0[2], scale1[2], scale0[2], scale1[2]},
+                                             {scale0[3], scale1[3], scale0[3], scale1[3]} };
+                scale0 += 4; scale1 += 4;
+                svscale0 = svld1_s32(pg32_4, tmp_scales[0]); svscale1 = svld1_s32(pg32_4, tmp_scales[1]);
+                svscale2 = svld1_s32(pg32_4, tmp_scales[2]); svscale3 = svld1_s32(pg32_4, tmp_scales[3]);
+                sumi1 = svmul_s32_x(pg32_4, svmmla_s32(svmmla_s32(svdup_n_s32(0), r0, l0), r1, l1), svscale0);
+                sumi2 = svmul_s32_x(pg32_4, svmmla_s32(svmmla_s32(svdup_n_s32(0), r2, l2), r3, l3), svscale1);
+                sumi3 = svmul_s32_x(pg32_4, svmmla_s32(svmmla_s32(svdup_n_s32(0), r4, l4), r5, l5), svscale2);
+                sumi4 = svmul_s32_x(pg32_4, svmmla_s32(svmmla_s32(svdup_n_s32(0), r6, l6), r7, l7), svscale3);
+                acc_sumi1 = svadd_s32_x(pg32_4, sumi1, sumi2);
+                acc_sumi2 = svadd_s32_x(pg32_4, sumi3, sumi4);
+                acc_tmp = svadd_s32_x(pg32_4, acc_sumi1, acc_sumi2);
+                isum_tmp = svadd_s32_x(pg32_4, isum_tmp, acc_tmp);
+                if(goto_flag) {
+                  goto_flag = 0;
+                  q8bytes_01 = svld1_s8(pg8_16, q80);    q8bytes_02 = svld1_s8(pg8_16, q80+16);
+                  q8bytes_03 = svld1_s8(pg8_16, q80+32); q8bytes_04 = svld1_s8(pg8_16, q80+48);
+                  q8bytes_11 = svld1_s8(pg8_16, q81);    q8bytes_12 = svld1_s8(pg8_16, q81+16);
+                  q8bytes_13 = svld1_s8(pg8_16, q81+32); q8bytes_14 = svld1_s8(pg8_16, q81+48);
+                  q80 += 64; q81 += 64;
+
+                  // decode 6bit data of input00
+                  // q6bytes_xx has 16 of block (each block has 16)
+                  // each suffinx means input and block number
+                  q6h_01 = svand_u8_x(pg8_16, mone, qhbits_01);
+                  q6h_02 = svand_u8_x(pg8_16, mone, qhbits_02);
+                  q6h_03 = svand_u8_x(pg8_16, mone, svlsr_n_u8_x(pg8_16, qhbits_01, 2));
+                  q6h_04 = svand_u8_x(pg8_16, mone, svlsr_n_u8_x(pg8_16, qhbits_02, 2));
+                  q6h_11 = svand_u8_x(pg8_16, mone, qhbits_11);
+                  q6h_12 = svand_u8_x(pg8_16, mone, qhbits_12);
+                  q6h_13 = svand_u8_x(pg8_16, mone, svlsr_n_u8_x(pg8_16, qhbits_11, 2));
+                  q6h_14 = svand_u8_x(pg8_16, mone, svlsr_n_u8_x(pg8_16, qhbits_12, 2));
+                  q6bytes_01 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_01, 4), q6h_01));
+                  q6bytes_02 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_02, 4), q6h_02));
+                  q6bytes_03 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_03, 4), q6h_03));
+                  q6bytes_04 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_04, 4), q6h_04));
+                  q6bytes_11 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_11, 4), q6h_11));
+                  q6bytes_12 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_12, 4), q6h_12));
+                  q6bytes_13 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_13, 4), q6h_13));
+                  q6bytes_14 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_14, 4), q6h_14));
+                  goto repeat;
+                } // end of if
+              } // end of for
+              sum = svadd_f32_x(pg32_4, sum,
+                                 svmul_f32_x(pg32_4,
+                                             svcvt_f32_x(pg32_4,
+                                                         svadd_s32_x(pg32_4, isum_tmp,
+                                                                     svmul_n_s32_x(pg32_4, svisum_mins, -32))),
+                                             svsuper_block_scales));
+            } // end of case 128
+            break;
+            case 256:
+            case 512:
+            {
+              // process q8sum summation 256 bit route
+              const svint16_t q8sums_0  = svld1_s16(pg16_16, vy0[i].bsums);
+              const svint16_t q8sums_1  = svld1_s16(pg16_16, vy1[i].bsums);
+              const svint16_t q6scales_0 = svunpklo_s16(svld1_s8(pg8_16, scale0));
+              const svint16_t q6scales_1 = svunpklo_s16(svld1_s8(pg8_16, scale1));
+              const svint64_t prod = svdup_n_s64(0);
+              int32_t isum_mins[4] = { svaddv_s64(svptrue_b64(), svdot_s64(prod, q8sums_0, q6scales_0)),
+                                       svaddv_s64(svptrue_b64(), svdot_s64(prod, q8sums_0, q6scales_1)),
+                                       svaddv_s64(svptrue_b64(), svdot_s64(prod, q8sums_1, q6scales_0)),
+                                       svaddv_s64(svptrue_b64(), svdot_s64(prod, q8sums_1, q6scales_1)) };
+              // process mmla
+
+              svuint8_t qhbits_01, qhbits_02, qhbits_11, qhbits_12,
+                        q6bits_01, q6bits_02, q6bits_03, q6bits_04,
+                        q6bits_11, q6bits_12, q6bits_13, q6bits_14;
+              svint8_t  q8bytes_01, q8bytes_02, q8bytes_03, q8bytes_04, l0, l2, l4, l6,
+                        q8bytes_11, q8bytes_12, q8bytes_13, q8bytes_14, r0, r2, r4, r6;
+              svint32_t sumi1, sumi2, sumi3, sumi4, acc_sumi1, acc_sumi2, acc_tmp,
+                        svscale0, svscale1, svscale2, svscale3;
+              svint32_t isum_tmp = svdup_n_s32(0);
+              svint32_t svisum_mins = svld1_s32(pg32_4, isum_mins);
+              for (int j = 0; j < QK_K/128; ++j) {
+                int goto_flag = 1;
+                qhbits_01 = svld1_u8(pg8_16, qh0);     qhbits_02 = svld1_u8(pg8_16, qh0+16);
+                qhbits_11 = svld1_u8(pg8_16, qh1);     qhbits_12 = svld1_u8(pg8_16, qh1+16);
+                qh0 += 32; qh1 += 32;
+                q6bits_01 = svld1_u8(pg8_16, ql0);     q6bits_02 = svld1_u8(pg8_16, ql0+16);
+                q6bits_03 = svld1_u8(pg8_16, ql0+32);  q6bits_04 = svld1_u8(pg8_16, ql0+48);
+                q6bits_11 = svld1_u8(pg8_16, ql1);     q6bits_12 = svld1_u8(pg8_16, ql1+16);
+                q6bits_13 = svld1_u8(pg8_16, ql1+32);  q6bits_14 = svld1_u8(pg8_16, ql1+48);
+                ql0 += 64; ql1 += 64;
+                q8bytes_01 = svld1_s8(pg8_16, q80);    q8bytes_02 = svld1_s8(pg8_16, q80+16);
+                q8bytes_03 = svld1_s8(pg8_16, q80+32); q8bytes_04 = svld1_s8(pg8_16, q80+48);
+                q8bytes_11 = svld1_s8(pg8_16, q81);    q8bytes_12 = svld1_s8(pg8_16, q81+16);
+                q8bytes_13 = svld1_s8(pg8_16, q81+32); q8bytes_14 = svld1_s8(pg8_16, q81+48);
+                q80 += 64; q81 += 64;
+
+                // decode 6bit data of input00
+                // q6bytes_xx has 16 of block (each block has 16)
+                // each suffinx means input and block number
+                q6h_01 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_01, 4));
+                q6h_02 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_02, 4));
+                q6h_03 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_01, 2));
+                q6h_04 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_02, 2));
+                q6h_11 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_11, 4));
+                q6h_12 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_12, 4));
+                q6h_13 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_11, 2));
+                q6h_14 = svand_u8_x(pg8_16, mone, svlsl_n_u8_x(pg8_16, qhbits_12, 2));
+
+                q6bytes_01 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_01, m4b), q6h_01));
+                q6bytes_02 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_02, m4b), q6h_02));
+                q6bytes_03 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_03, m4b), q6h_03));
+                q6bytes_04 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_04, m4b), q6h_04));
+                q6bytes_11 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_11, m4b), q6h_11));
+                q6bytes_12 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_12, m4b), q6h_12));
+                q6bytes_13 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_13, m4b), q6h_13));
+                q6bytes_14 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svand_u8_x(pg8_16, q6bits_14, m4b), q6h_14));
+
+                repeat256:
+                // mmla
+                l0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q6bytes_01), svreinterpret_s64_s8(q6bytes_11)));
+                l2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q6bytes_02), svreinterpret_s64_s8(q6bytes_12)));
+                l4 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q6bytes_03), svreinterpret_s64_s8(q6bytes_13)));
+                l6 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q6bytes_04), svreinterpret_s64_s8(q6bytes_14)));
+                r0 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_01), svreinterpret_s64_s8(q8bytes_11)));
+                r2 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_02), svreinterpret_s64_s8(q8bytes_12)));
+                r4 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_03), svreinterpret_s64_s8(q8bytes_13)));
+                r6 = svreinterpret_s8_s64(svzip1_s64(svreinterpret_s64_s8(q8bytes_04), svreinterpret_s64_s8(q8bytes_14)));
+                // multiply scales of q6bit
+                int32_t tmp_scales[4][8] = {{scale0[0], scale1[0], scale0[0], scale1[0], scale0[0], scale1[0], scale0[0], scale1[0]},
+                                            {scale0[1], scale1[1], scale0[1], scale1[1], scale0[1], scale1[1], scale0[1], scale1[1]},
+                                            {scale0[2], scale1[2], scale0[2], scale1[2], scale0[2], scale1[2], scale0[2], scale1[2]},
+                                            {scale0[3], scale1[3], scale0[3], scale1[3], scale0[3], scale1[3], scale0[3], scale1[3]}};
+                scale0 += 4; scale1 += 4;
+                svscale0 = svld1_s32(pg32_8, tmp_scales[0]); svscale1 = svld1_s32(pg32_8, tmp_scales[1]);
+                svscale2 = svld1_s32(pg32_8, tmp_scales[2]); svscale3 = svld1_s32(pg32_8, tmp_scales[3]);
+                sumi1 = svmul_s32_x(pg32_8, svmmla_s32(svdup_n_s32(0), r0, l0), svscale0);
+                sumi2 = svmul_s32_x(pg32_8, svmmla_s32(svdup_n_s32(0), r2, l2), svscale1);
+                sumi3 = svmul_s32_x(pg32_8, svmmla_s32(svdup_n_s32(0), r4, l4), svscale2);
+                sumi4 = svmul_s32_x(pg32_8, svmmla_s32(svdup_n_s32(0), r6, l6), svscale3);
+                acc_sumi1 = svadd_s32_x(pg32_4, sumi1, sumi2);
+                acc_sumi2 = svadd_s32_x(pg32_4, sumi3, sumi4);
+                acc_tmp = svadd_s32_x(pg32_4, acc_sumi1, acc_sumi2);
+                isum_tmp = svadd_s32_x(pg32_4, isum_tmp, acc_tmp);
+                if(goto_flag) {
+                  goto_flag = 0;
+                  q8bytes_01 = svld1_s8(pg8_16, q80);    q8bytes_02 = svld1_s8(pg8_16, q80+16);
+                  q8bytes_03 = svld1_s8(pg8_16, q80+32); q8bytes_04 = svld1_s8(pg8_16, q80+48);
+                  q8bytes_11 = svld1_s8(pg8_16, q81);    q8bytes_12 = svld1_s8(pg8_16, q81+16);
+                  q8bytes_13 = svld1_s8(pg8_16, q81+32); q8bytes_14 = svld1_s8(pg8_16, q81+48);
+                  q80 += 64; q81 += 64;
+
+                  // decode 6bit data of input00
+                  // q6bytes_xx has 16 of block (each block has 16)
+                  // each suffinx means input and block number
+                  q6h_01 = svand_u8_x(pg8_16, mone, qhbits_01);
+                  q6h_02 = svand_u8_x(pg8_16, mone, qhbits_02);
+                  q6h_03 = svand_u8_x(pg8_16, mone, svlsr_n_u8_x(pg8_16, qhbits_01, 2));
+                  q6h_04 = svand_u8_x(pg8_16, mone, svlsr_n_u8_x(pg8_16, qhbits_02, 2));
+                  q6h_11 = svand_u8_x(pg8_16, mone, qhbits_11);
+                  q6h_12 = svand_u8_x(pg8_16, mone, qhbits_12);
+                  q6h_13 = svand_u8_x(pg8_16, mone, svlsr_n_u8_x(pg8_16, qhbits_11, 2));
+                  q6h_14 = svand_u8_x(pg8_16, mone, svlsr_n_u8_x(pg8_16, qhbits_12, 2));
+                  q6bytes_01 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_01, 4), q6h_01));
+                  q6bytes_02 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_02, 4), q6h_02));
+                  q6bytes_03 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_03, 4), q6h_03));
+                  q6bytes_04 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_04, 4), q6h_04));
+                  q6bytes_11 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_11, 4), q6h_11));
+                  q6bytes_12 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_12, 4), q6h_12));
+                  q6bytes_13 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_13, 4), q6h_13));
+                  q6bytes_14 = svreinterpret_s8_u8(svorr_u8_x(pg8_16, svlsr_n_u8_x(pg8_16, q6bits_14, 4), q6h_14));
+                  goto repeat256;
+                } // end of if
+              } // end of for
+              svint32_t swap_isum_tmp = svext_s32(isum_tmp, isum_tmp, 4);
+              isum_tmp = svadd_s32_x(pg32_4, isum_tmp, swap_isum_tmp);
+              sum = svadd_f32_x(pg32_4, sum,
+                                 svmul_f32_x(pg32_4,
+                                             svcvt_f32_x(pg32_4,
+                                                         svadd_s32_x(pg32_4, isum_tmp,
+                                                                     svmul_n_s32_x(pg32_4, svisum_mins, -32))),
+                                             svsuper_block_scales));
+            } // end of case 256
+            break;
+          default:
+            assert(false && "Unsupported vector length");
+            break;
+        } // end of switch
+      } // end of for
+      svst1_f32(pg32_2, s, sum);
+      svst1_f32(pg32_2, s + bs, svreinterpret_f32_u8(svext_u8(svreinterpret_u8_f32(sum), svdup_n_u8(0), 8)));
+#ifdef GET_PA
+      pthread_mutex_lock(&mutex);
+      clock_gettime(CLOCK_REALTIME, &i8mm_end_ts);
+      q6_K_data.i8mm_nsec += (i8mm_end_ts.tv_sec - i8mm_start_ts.tv_sec) * 1e9L + (i8mm_end_ts.tv_nsec - i8mm_start_ts.tv_nsec);
+      pthread_mutex_unlock(&mutex);
+#endif
+      return;
+    }
+#else
     if (nrc == 2) {
         const block_q6_K * GGML_RESTRICT x0 = x;
         const block_q6_K * GGML_RESTRICT x1 = (const block_q6_K *) ((const uint8_t *)vx + bx);
@@ -2847,6 +3415,7 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         return;
     }
+#endif //SVE or NEON
 #endif
 
 #ifdef __ARM_FEATURE_SVE
